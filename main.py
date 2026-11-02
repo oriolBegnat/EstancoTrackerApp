@@ -1,11 +1,16 @@
 import os
-from dotenv import load_dotenv
+import requests
+import gspread
+from google.oauth2.service_account import Credentials
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 
-# 1. Calculamos la ruta exacta
+# 1. Calculamos la ruta exacta del directorio de trabajo
 directorio_actual = os.path.dirname(os.path.abspath(__file__))
 ruta_env = os.path.join(directorio_actual, ".env")
+ruta_creds = os.path.join(directorio_actual, "credentials.json")
 
-# 2. Leemos el archivo manualmente (a prueba de caracteres invisibles)
+# 2. Leemos el archivo .env manualmente (a prueba de caracteres BOM / Windows)
 if os.path.exists(ruta_env):
     with open(ruta_env, "r", encoding="utf-8-sig") as f:
         for linea in f:
@@ -16,16 +21,58 @@ if os.path.exists(ruta_env):
 
 API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-import requests
-import csv
-from io import StringIO
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-
 # Inicializamos la API
 app = FastAPI(title="EstancoTracker Web")
 
-URL_GOOGLE_SHEETS = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQJHZIKV0rgQ04qR-Wndaa8kAfhvEAMv9ZqjuoqG3f7H-btUW8s9akOySvDgQyWuwIZsF3MJtVaxKEz/pub?output=csv"
+# ==========================================
+# CONFIGURACIÓN GOOGLE SHEETS (gspread)
+# ==========================================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# ID de la hoja de cálculo extraído de su URL
+SPREADSHEET_ID = "1ajQUyT_wT-nu8HykaughBzHrFed-YLdN7jTaNcueaIA"
+
+
+def cargar_base_datos_gspread():
+    """Descarga los registros usando la cuenta de servicio y gspread."""
+    print("\n[DEBUG SHEETS] Conectando con Google Sheets via gspread...")
+    if not os.path.exists(ruta_creds):
+        print(f"[DEBUG SHEETS] ERROR: No se encontró el archivo de credenciales en {ruta_creds}")
+        return None
+
+    try:
+        creds = Credentials.from_service_account_file(ruta_creds, scopes=SCOPES)
+        cliente = gspread.authorize(creds)
+        
+        hoja_calculo = cliente.open_by_key(SPREADSHEET_ID)
+        pestaña = hoja_calculo.sheet1  # Primera pestaña por defecto
+        
+        registros = pestaña.get_all_records()
+        print(f"[DEBUG SHEETS] Éxito: {len(registros)} registros recuperados.")
+
+        base_datos = {}
+        for fila in registros:
+            # Buscamos la columna de identificación (Nombre Estanco o ID Estanco)
+            clave_id = fila.get("Nombre Estanco") or fila.get("ID Estanco")
+            if not clave_id:
+                continue
+
+            id_estanco = str(clave_id).strip().upper()
+            base_datos[id_estanco] = {
+                "direccion": str(fila.get("Dirección estanco", fila.get("Direccion estanco", ""))).strip(),
+                "municipio": str(fila.get("Municipio", "")).strip(),
+                "codPostal": str(fila.get("Codigo Postal", fila.get("Código Postal", fila.get("CP", "")))).strip()
+            }
+
+        return base_datos
+
+    except Exception as e:
+        print(f"[DEBUG SHEETS] ERROR de autenticación o lectura: {e}\n")
+        return None
+
 
 # ==========================================
 # INTERFAZ WEB (FRONTEND)
@@ -82,7 +129,7 @@ def cargar_interfaz_web():
                 <p><a id="r-maps" href="#" target="_blank" style="color: #3498db; text-decoration: none; font-weight: bold;">Ver en Google Maps 🌍</a></p>
                 
                 <div class="reviews-container">
-                    <strong>Reseñas:</strong>
+                    <strong>Últimas 5 Reseñas:</strong>
                     <div id="r-resenas" style="margin-top: 10px;"></div>
                 </div>
             </div>
@@ -116,7 +163,6 @@ def cargar_interfaz_web():
                     document.getElementById('r-horarios').textContent = data.horarios.join('\\n') || 'No disponible';
                     document.getElementById('r-maps').href = data.url_maps;
 
-                    // Renderizado de las reseñas
                     const contenedorResenas = document.getElementById('r-resenas');
                     contenedorResenas.innerHTML = '';
                     
@@ -124,7 +170,6 @@ def cargar_interfaz_web():
                         data.resenas.forEach(resena => {
                             const card = document.createElement('div');
                             card.className = 'review-item';
-                            
                             const stars = resena.calificacion ? '⭐'.repeat(resena.calificacion) : '';
                             
                             card.innerHTML = `
@@ -155,57 +200,18 @@ def cargar_interfaz_web():
     """
     return html_content
 
-# ==========================================
-# EL PUENTE DE DATOS Y LÓGICA (BACKEND)
-# ==========================================
-def cargar_base_datos_online(url):
-    print("\n[DEBUG SHEETS] Intentando descargar datos...")
-    try:
-        response = requests.get(url)
-        print(f"[DEBUG SHEETS] Código respuesta Google: {response.status_code}")
-        print(f"[DEBUG SHEETS] Tipo de archivo recibido: {response.headers.get('Content-Type', '')}")
-        
-        if 'text/html' in response.headers.get('Content-Type', ''):
-            print("[DEBUG SHEETS] ERROR: Google devuelve una web bloqueada, no un CSV.")
-            return None
-            
-        response.raise_for_status() 
-        response.encoding = 'utf-8'
-        
-        archivo_virtual = StringIO(response.text)
-        lector = csv.DictReader(archivo_virtual, delimiter=',')
-        
-        cabeceras = lector.fieldnames
-        print(f"[DEBUG SHEETS] Columnas detectadas en tu Excel: {cabeceras}")
-        
-        if not cabeceras or 'Nombre Estanco' not in cabeceras:
-            print("[DEBUG SHEETS] ERROR: Falta la columna 'Nombre Estanco'.")
-            return None
-            
-        base_datos = {}
-        for fila in lector:
-            if not fila.get('Nombre Estanco'): continue
-            id_estanco = str(fila['Nombre Estanco']).strip().upper()
-            base_datos[id_estanco] = {
-                "direccion": str(fila.get('Dirección estanco', fila.get('Direccion estanco', ''))).strip(),
-                "municipio": str(fila.get('Municipio', '')).strip(),
-                "codPostal": str(fila.get('Codigo Postal', fila.get('Código Postal', fila.get('CP', '')))).strip()
-            }
-        print(f"[DEBUG SHEETS] Éxito: {len(base_datos)} estancos cargados.\n")
-        return base_datos
-        
-    except Exception as e:
-        print(f"[DEBUG SHEETS] ERROR INTERNO en Python: {e}\n")
-        return None
 
+# ==========================================
+# ENDPOINT DE BÚSQUEDA (BACKEND)
+# ==========================================
 @app.get("/estanco/{id_completo}")
 def consultar_estanco(id_completo: str):
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API Key no configurada.")
         
-    base_datos = cargar_base_datos_online(URL_GOOGLE_SHEETS)
+    base_datos = cargar_base_datos_gspread()
     if base_datos is None:
-        raise HTTPException(status_code=500, detail="Error de conexión con Sheets.")
+        raise HTTPException(status_code=500, detail="Error de conexión con Sheets mediante gspread.")
     
     id_busqueda = id_completo.strip().upper()
     
@@ -219,7 +225,7 @@ def consultar_estanco(id_completo: str):
     datos_reales = base_datos[id_busqueda]
     query_places = f"Estanco {datos_reales['direccion']}, {datos_reales['codPostal']} {datos_reales['municipio']}".strip()
     
-    # PASO 1: Buscar el estanco para obtener los datos básicos y el ID único del lugar
+    # 1. Búsqueda básica en Google Places
     search_url = "https://places.googleapis.com/v1/places:searchText"
     search_payload = {
         "textQuery": query_places,
@@ -240,7 +246,7 @@ def consultar_estanco(id_completo: str):
     estanco = search_data["places"][0]
     place_id = estanco.get("id")
     
-    # PASO 2: Obtener las reseñas del lugar mediante Place Details
+    # 2. Obtención de las reseñas del estanco (Place Details)
     resenas_procesadas = []
     if place_id:
         details_url = f"https://places.googleapis.com/v1/places/{place_id}"
