@@ -214,6 +214,8 @@ tempCodeRunnerFile.py
 # Marimo
 marimo/_static/
 marimo/_lsp/
+
+.env
 __marimo__/
 
 # Streamlit
